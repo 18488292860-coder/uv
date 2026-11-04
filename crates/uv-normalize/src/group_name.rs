@@ -39,7 +39,7 @@ impl GroupName {
     ///
     /// At present, this is no more efficient than calling [`GroupName::from_str`].
     #[expect(clippy::needless_pass_by_value)]
-    pub fn from_owned(name: String) -> Result<Self, InvalidNameError> {
+    fn from_owned(name: String) -> Result<Self, InvalidNameError> {
         validate_and_normalize_ref(&name).map(Self)
     }
 
@@ -181,6 +181,15 @@ pub enum DefaultGroups {
     List(Vec<GroupName>),
 }
 
+impl DefaultGroups {
+    /// Create a sorted, deduplicated list of default dependency groups.
+    pub fn from_groups(mut groups: Vec<GroupName>) -> Self {
+        groups.sort_unstable();
+        groups.dedup();
+        Self::List(groups)
+    }
+}
+
 #[cfg(feature = "schemars")]
 impl schemars::JsonSchema for DefaultGroups {
     fn schema_name() -> Cow<'static, str> {
@@ -262,7 +271,7 @@ impl<'de> serde::Deserialize<'de> for DefaultGroups {
                     groups.push(elem);
                 }
 
-                Ok(DefaultGroups::List(groups))
+                Ok(DefaultGroups::from_groups(groups))
             }
         }
 

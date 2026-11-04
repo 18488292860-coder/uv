@@ -4,7 +4,7 @@ uv provides a high-level interface for storing and retrieving credentials from s
 
 ## Logging in to a service
 
-To add credentials for service, use the `uv auth login` command:
+To add credentials for a service, use the `uv auth login` command:
 
 ```console
 $ uv auth login example.com
@@ -32,7 +32,7 @@ will not yet be used for Git requests.
 
 !!! note
 
-    The credentials will not be validated, i.e., incorrect credentials will not fail.
+    uv does not validate the credentials, so the command succeeds even if they are incorrect.
 
 ## Logging out of a service
 
@@ -44,8 +44,7 @@ $ uv auth logout example.com
 
 !!! note
 
-    The credentials will not be invalidated with the remote server, i.e., they will only be removed
-    from local storage not rendered unusable.
+    The credentials are removed from local storage but are not invalidated on the remote server.
 
 ## Showing credentials for a service
 
@@ -60,6 +59,35 @@ If a username was used to log in, it will need to be provided as well, e.g.:
 ```console
 $ uv auth token --username foo example.com
 ```
+
+## Using credentials with external tools
+
+`uv auth helper` allows tools that support credential helpers to request HTTP credentials from uv.
+At this time, uv supports the
+[Bazel credential helper protocol](https://github.com/bazelbuild/proposals/blob/main/designs/2022-06-07-bazel-credential-helpers.md).
+
+The command is intended to be invoked by external tools. It reads a JSON request from stdin and
+writes a JSON response to stdout. When matching credentials are available, the response includes the
+`Authorization` header:
+
+```console
+$ echo '{"uri": "https://example.com/path"}' | uv --preview-features auth-helper auth helper --protocol=bazel get
+{"headers":{"Authorization":["Basic ..."]}}
+```
+
+If no credentials are found, uv will return an empty set of headers:
+
+```json
+{ "headers": {} }
+```
+
+!!! note
+
+    `uv auth helper` is experimental. Use `--preview-features auth-helper` or
+    `UV_PREVIEW_FEATURES=auth-helper` to disable the warning.
+
+The [Bazel integration guide](../../guides/integration/bazel.md) explains how to use this command
+with Bazel.
 
 ## Configuring the storage backend
 

@@ -4,12 +4,23 @@ use std::str::FromStr;
 use tracing::debug;
 
 use uv_pep440::Version;
-use uv_static::EnvVars;
 
 #[cfg(windows)]
-use serde::Deserialize;
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    CM_GETIDLIST_FILTER_CLASS, CM_GETIDLIST_FILTER_PRESENT, CM_Get_Device_ID_List_SizeW,
+    CM_Get_Device_ID_ListW, CR_SUCCESS,
+};
+
+use crate::nvidia::NvidiaGpu;
+
+// Constants used for PCI device detection.
+const PCI_BASE_CLASS_MASK: u32 = 0x00ff_0000;
+const PCI_BASE_CLASS_DISPLAY: u32 = 0x0003_0000;
+const PCI_VENDOR_ID_INTEL: u32 = 0x8086;
+// https://learn.microsoft.com/en-us/windows-hardware/drivers/install/system-defined-device-setup-classes-available-to-vendors
 #[cfg(windows)]
-use wmi::WMIConnection;
+const WINDOWS_DISPLAY_ADAPTER_CLASS_GUID: windows::core::PCWSTR =
+    windows::core::w!("{4d36e968-e325-11ce-bfc1-08002be10318}");
 
 #[derive(Debug, thiserror::Error)]
 pub enum AcceleratorError {
@@ -26,7 +37,7 @@ pub enum AcceleratorError {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Accelerator {
+pub(crate) enum Accelerator {
     /// The CUDA driver version (e.g., `550.144.03`).
     ///
     /// This is in contrast to the CUDA toolkit version (e.g., `12.8.0`).
@@ -57,94 +68,37 @@ impl std::fmt::Display for Accelerator {
 impl Accelerator {
     /// Detect the GPU driver and/or architecture version from the system.
     ///
+    /// The `cuda_driver_version` and `amd_gpu_architecture` overrides, if provided, take
+    /// precedence over system detection and correspond to the `UV_CUDA_DRIVER_VERSION` and
+    /// `UV_AMD_GPU_ARCHITECTURE` environment variables respectively.
+    ///
     /// Query, in order:
-    /// 1. The `UV_CUDA_DRIVER_VERSION` environment variable.
-    /// 2. The `UV_AMD_GPU_ARCHITECTURE` environment variable.
-    /// 3. `/sys/module/nvidia/version`, which contains the driver version (e.g., `550.144.03`).
-    /// 4. `/proc/driver/nvidia/version`, which contains the driver version among other information.
-    /// 5. `nvidia-smi --query-gpu=driver_version --format=csv,noheader`.
-    /// 6. `rocm_agent_enumerator`, which lists the AMD GPU architectures.
-    /// 7. `/sys/bus/pci/devices`, filtering for the Intel GPU via PCI.
-    /// 8. Windows Managmeent Instrumentation (WMI), filtering for the Intel GPU via PCI.
-    pub fn detect() -> Result<Option<Self>, AcceleratorError> {
-        // Constants used for PCI device detection.
-        const PCI_BASE_CLASS_MASK: u32 = 0x00ff_0000;
-        const PCI_BASE_CLASS_DISPLAY: u32 = 0x0003_0000;
-        const PCI_VENDOR_ID_INTEL: u32 = 0x8086;
-
-        // Read from `UV_CUDA_DRIVER_VERSION`.
-        if let Ok(driver_version) = std::env::var(EnvVars::UV_CUDA_DRIVER_VERSION) {
-            let driver_version = Version::from_str(&driver_version)?;
+    /// 1. The `cuda_driver_version` override (from `UV_CUDA_DRIVER_VERSION`).
+    /// 2. The `amd_gpu_architecture` override (from `UV_AMD_GPU_ARCHITECTURE`).
+    /// 3. [`NvidiaGpu::detect_driver_version`].
+    /// 4. `rocm_agent_enumerator`, which lists the AMD GPU architectures.
+    /// 5. `/sys/bus/pci/devices`, filtering for the Intel GPU via PCI.
+    /// 6. The Windows device tree, filtering for present Intel display adapters via PCI.
+    pub(crate) fn detect(
+        cuda_driver_version: Option<Version>,
+        amd_gpu_architecture: Option<AmdGpuArchitecture>,
+    ) -> Result<Option<Self>, AcceleratorError> {
+        // Use the `UV_CUDA_DRIVER_VERSION` override, if provided.
+        if let Some(driver_version) = cuda_driver_version {
             debug!("Detected CUDA driver version from `UV_CUDA_DRIVER_VERSION`: {driver_version}");
             return Ok(Some(Self::Cuda { driver_version }));
         }
 
-        // Read from `UV_AMD_GPU_ARCHITECTURE`.
-        if let Ok(gpu_architecture) = std::env::var(EnvVars::UV_AMD_GPU_ARCHITECTURE) {
-            let gpu_architecture = AmdGpuArchitecture::from_str(&gpu_architecture)?;
+        // Use the `UV_AMD_GPU_ARCHITECTURE` override, if provided.
+        if let Some(gpu_architecture) = amd_gpu_architecture {
             debug!(
                 "Detected AMD GPU architecture from `UV_AMD_GPU_ARCHITECTURE`: {gpu_architecture}"
             );
             return Ok(Some(Self::Amd { gpu_architecture }));
         }
 
-        // Read from `/sys/module/nvidia/version`.
-        match fs_err::read_to_string("/sys/module/nvidia/version") {
-            Ok(content) => {
-                return match parse_sys_module_nvidia_version(&content) {
-                    Ok(driver_version) => {
-                        debug!(
-                            "Detected CUDA driver version from `/sys/module/nvidia/version`: {driver_version}"
-                        );
-                        Ok(Some(Self::Cuda { driver_version }))
-                    }
-                    Err(e) => Err(e),
-                };
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-
-        // Read from `/proc/driver/nvidia/version`
-        match fs_err::read_to_string("/proc/driver/nvidia/version") {
-            Ok(content) => match parse_proc_driver_nvidia_version(&content) {
-                Ok(Some(driver_version)) => {
-                    debug!(
-                        "Detected CUDA driver version from `/proc/driver/nvidia/version`: {driver_version}"
-                    );
-                    return Ok(Some(Self::Cuda { driver_version }));
-                }
-                Ok(None) => {
-                    debug!(
-                        "Failed to parse CUDA driver version from `/proc/driver/nvidia/version`"
-                    );
-                }
-                Err(e) => return Err(e),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-
-        // Query `nvidia-smi`.
-        if let Ok(output) = std::process::Command::new("nvidia-smi")
-            .arg("--query-gpu=driver_version")
-            .arg("--format=csv,noheader")
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8(output.stdout)?;
-                if let Some(first_line) = stdout.lines().next() {
-                    let driver_version = Version::from_str(first_line.trim())?;
-                    debug!("Detected CUDA driver version from `nvidia-smi`: {driver_version}");
-                    return Ok(Some(Self::Cuda { driver_version }));
-                }
-            }
-
-            debug!(
-                "Failed to query CUDA driver version with `nvidia-smi` with status `{}`: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
+        if let Some(driver_version) = NvidiaGpu::detect_driver_version()? {
+            return Ok(Some(Self::Cuda { driver_version }));
         }
 
         // Query `rocm_agent_enumerator` to detect the AMD GPU architecture.
@@ -196,72 +150,18 @@ impl Accelerator {
             Err(e) => return Err(e.into()),
         }
 
-        // Detect Intel GPU via WMI on Windows
+        // Detect Intel GPU via present Windows display adapters.
+        // TODO: Consider rejecting display adapters with disabled/problem devnode status.
+        // See: `CM_Locate_DevNodeW` + `CM_Get_DevNode_Status`
         #[cfg(windows)]
-        {
-            #[derive(Deserialize, Debug)]
-            #[serde(rename = "Win32_VideoController")]
-            #[serde(rename_all = "PascalCase")]
-            struct VideoController {
-                #[serde(rename = "PNPDeviceID")]
-                pnp_device_id: Option<String>,
-                name: Option<String>,
-            }
-
-            match WMIConnection::new() {
-                Ok(wmi_connection) => match wmi_connection.query::<VideoController>() {
-                    Ok(gpu_controllers) => {
-                        for gpu_controller in gpu_controllers {
-                            if let Some(pnp_device_id) = &gpu_controller.pnp_device_id {
-                                if pnp_device_id.contains(&format!("VEN_{PCI_VENDOR_ID_INTEL:04X}"))
-                                {
-                                    debug!(
-                                        "Detected Intel GPU from WMI: PNPDeviceID={}, Name={:?}",
-                                        pnp_device_id, gpu_controller.name
-                                    );
-                                    return Ok(Some(Self::Xpu));
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        debug!("Failed to query WMI for video controllers: {e}");
-                    }
-                },
-                Err(e) => {
-                    debug!("Failed to create WMI connection: {e}");
-                }
-            }
+        if detect_intel_gpu_from_windows_devices() {
+            return Ok(Some(Self::Xpu));
         }
 
         debug!("Failed to detect GPU driver version");
 
         Ok(None)
     }
-}
-
-/// Parse the CUDA driver version from the content of `/sys/module/nvidia/version`.
-fn parse_sys_module_nvidia_version(content: &str) -> Result<Version, AcceleratorError> {
-    // Parse, e.g.:
-    // ```text
-    // 550.144.03
-    // ```
-    let driver_version = Version::from_str(content.trim())?;
-    Ok(driver_version)
-}
-
-/// Parse the CUDA driver version from the content of `/proc/driver/nvidia/version`.
-fn parse_proc_driver_nvidia_version(content: &str) -> Result<Option<Version>, AcceleratorError> {
-    // Parse, e.g.:
-    // ```text
-    // NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  550.144.03  Release Build  (dvs-builder@U16-I3-D08-1-2)  Mon Dec 30 17:26:13 UTC 2024
-    // GCC version:  gcc version 12.3.0 (Ubuntu 12.3.0-1ubuntu1~22.04)
-    // ```
-    let Some(version) = content.split("  ").nth(1) else {
-        return Ok(None);
-    };
-    let driver_version = Version::from_str(version.trim())?;
-    Ok(Some(driver_version))
 }
 
 /// Reads and parses the PCI class and vendor ID from a given device path under `/sys/bus/pci/devices`.
@@ -278,6 +178,77 @@ fn parse_pci_device_ids(device_path: &Path) -> Result<(u32, u32), AcceleratorErr
     let pci_vendor = u32::from_str_radix(vendor_content.trim().trim_start_matches("0x"), 16)?;
 
     Ok((pci_class, pci_vendor))
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn detect_intel_gpu_from_windows_devices() -> bool {
+    const FLAGS: u32 = CM_GETIDLIST_FILTER_CLASS | CM_GETIDLIST_FILTER_PRESENT;
+
+    let mut device_ids_len = 0;
+    // SAFETY: The class GUID is a static null-terminated UTF-16 string, `device_ids_len` is a
+    // valid out pointer, and Configuration Manager writes only that scalar result here.
+    let result = unsafe {
+        CM_Get_Device_ID_List_SizeW(
+            &raw mut device_ids_len,
+            WINDOWS_DISPLAY_ADAPTER_CLASS_GUID,
+            FLAGS,
+        )
+    };
+    if result != CR_SUCCESS {
+        debug!("Failed to query Windows display adapter device list length: {result:?}");
+        return false;
+    }
+
+    let Ok(device_ids_len) = usize::try_from(device_ids_len) else {
+        debug!("Windows display adapter device list length does not fit in memory");
+        return false;
+    };
+    let mut encoded_device_ids = vec![0; device_ids_len];
+
+    // SAFETY: The class GUID is a static null-terminated UTF-16 string, and the writable buffer
+    // length matches the size returned by `CM_Get_Device_ID_List_SizeW` for the same filter.
+    let result = unsafe {
+        CM_Get_Device_ID_ListW(
+            WINDOWS_DISPLAY_ADAPTER_CLASS_GUID,
+            &mut encoded_device_ids,
+            FLAGS,
+        )
+    };
+    if result != CR_SUCCESS {
+        debug!("Failed to query present Windows display adapters: {result:?}");
+        return false;
+    }
+
+    for device_id in windows_device_ids(&encoded_device_ids) {
+        if contains_intel_vendor_id(&device_id) {
+            debug!("Detected Intel GPU from present Windows display adapter: {device_id}");
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(any(windows, test))]
+fn contains_intel_vendor_id(pnp_device_id: &str) -> bool {
+    pnp_device_id
+        .split(['\\', '&'])
+        .any(|segment| segment.eq_ignore_ascii_case("VEN_8086"))
+}
+
+#[cfg(any(windows, test))]
+fn windows_device_ids(encoded_device_ids: &[u16]) -> impl Iterator<Item = String> + '_ {
+    encoded_device_ids
+        .split(|code_unit| *code_unit == 0)
+        .filter(|device_id| !device_id.is_empty())
+        .filter_map(|device_id| match String::from_utf16(device_id) {
+            Ok(device_id) => Some(device_id),
+            Err(err) => {
+                debug!("Failed to decode Windows device instance ID: {err}");
+                None
+            }
+        })
 }
 
 /// A GPU architecture for AMD GPUs.
@@ -351,29 +322,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proc_driver_nvidia_version() {
-        let content = "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  550.144.03  Release Build  (dvs-builder@U16-I3-D08-1-2)  Mon Dec 30 17:26:13 UTC 2024\nGCC version:  gcc version 12.3.0 (Ubuntu 12.3.0-1ubuntu1~22.04)";
-        let result = parse_proc_driver_nvidia_version(content).unwrap();
-        assert_eq!(result, Some(Version::from_str("550.144.03").unwrap()));
-
-        let content = "NVRM version: NVIDIA UNIX x86_64 Kernel Module  375.74  Wed Jun 14 01:39:39 PDT 2017\nGCC version:  gcc version 5.4.0 20160609 (Ubuntu 5.4.0-6ubuntu1~16.04.4)";
-        let result = parse_proc_driver_nvidia_version(content).unwrap();
-        assert_eq!(result, Some(Version::from_str("375.74").unwrap()));
+    fn intel_vendor_id_from_pnp_device_id() {
+        assert!(contains_intel_vendor_id(
+            r"PCI\VEN_8086&DEV_9A49&SUBSYS_00000000"
+        ));
+        assert!(contains_intel_vendor_id(
+            r"pci\ven_8086&dev_9a49&subsys_00000000"
+        ));
+        assert!(!contains_intel_vendor_id(
+            r"PCI\VEN_10DE&DEV_2504&SUBSYS_00000000"
+        ));
+        assert!(!contains_intel_vendor_id(r"PCI\DEV_8086&SUBSYS_00000000"));
     }
 
     #[test]
-    fn nvidia_smi_multi_gpu() {
-        // Test that we can parse nvidia-smi output with multiple GPUs (multiple lines)
-        let single_gpu = "572.60\n";
-        if let Some(first_line) = single_gpu.lines().next() {
-            let version = Version::from_str(first_line.trim()).unwrap();
-            assert_eq!(version, Version::from_str("572.60").unwrap());
-        }
+    fn windows_device_instance_ids() {
+        let intel_gpu = r"PCI\VEN_8086&DEV_9A49&SUBSYS_00000000\3&11583659&0&10";
+        let nvidia_gpu = r"PCI\VEN_10DE&DEV_2504&SUBSYS_00000000\4&12AB34CD&0&0008";
 
-        let multi_gpu = "572.60\n572.60\n";
-        if let Some(first_line) = multi_gpu.lines().next() {
-            let version = Version::from_str(first_line.trim()).unwrap();
-            assert_eq!(version, Version::from_str("572.60").unwrap());
-        }
+        let mut encoded_device_ids = Vec::new();
+        encoded_device_ids.extend(intel_gpu.encode_utf16());
+        encoded_device_ids.push(0);
+        encoded_device_ids.extend(nvidia_gpu.encode_utf16());
+        encoded_device_ids.extend([0, 0]);
+
+        assert_eq!(
+            windows_device_ids(&encoded_device_ids).collect::<Vec<_>>(),
+            vec![intel_gpu.to_string(), nvidia_gpu.to_string()]
+        );
     }
 }

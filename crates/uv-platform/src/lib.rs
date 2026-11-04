@@ -1,5 +1,6 @@
 //! Platform detection for operating system, architecture, and libc.
 
+use std::borrow::Cow;
 use std::cmp;
 use std::fmt;
 use std::str::FromStr;
@@ -8,12 +9,13 @@ use thiserror::Error;
 use tracing::trace;
 
 pub use crate::arch::{Arch, ArchVariant};
-pub use crate::libc::{Libc, LibcDetectionError, LibcVersion};
+pub use crate::host::{LinuxOsRelease, OsRelease, OsType};
+pub use crate::libc::{Libc, LibcDetectionError};
 pub use crate::os::Os;
 
 mod arch;
 mod cpuinfo;
-pub mod host;
+mod host;
 mod libc;
 mod os;
 
@@ -137,16 +139,17 @@ impl Platform {
     /// Convert this platform to a `cargo-dist` style triple string.
     pub fn as_cargo_dist_triple(&self) -> String {
         use target_lexicon::{
-            Architecture, ArmArchitecture, OperatingSystem, Riscv64Architecture, X86_32Architecture,
+            Architecture, ArmArchitecture, Environment, OperatingSystem, Riscv64Architecture,
+            X86_32Architecture,
         };
 
         let Self { os, arch, libc } = &self;
 
         let arch_name = match arch.family() {
             // Special cases where Display doesn't match target triple
-            Architecture::X86_32(X86_32Architecture::I686) => "i686".to_string(),
-            Architecture::Riscv64(Riscv64Architecture::Riscv64) => "riscv64gc".to_string(),
-            _ => arch.to_string(),
+            Architecture::X86_32(X86_32Architecture::I686) => Cow::Borrowed("i686"),
+            Architecture::Riscv64(Riscv64Architecture::Riscv64) => Cow::Borrowed("riscv64gc"),
+            _ => Cow::Owned(arch.to_string()),
         };
         let vendor = match &**os {
             OperatingSystem::Darwin(_) => "apple",
@@ -154,18 +157,28 @@ impl Platform {
             _ => "unknown",
         };
         let os_name = match &**os {
-            OperatingSystem::Darwin(_) => "darwin",
-            _ => &os.to_string(),
+            OperatingSystem::Darwin(_) => Cow::Borrowed("darwin"),
+            _ => Cow::Owned(os.to_string()),
         };
 
         let abi = match (&**os, libc) {
-            (OperatingSystem::Windows, _) => Some("msvc".to_string()),
+            (OperatingSystem::Windows, _) => Some(Cow::Borrowed("msvc")),
             (OperatingSystem::Linux, Libc::Some(env)) => Some({
-                // Special suffix for ARM with hardware float
-                if matches!(arch.family(), Architecture::Arm(ArmArchitecture::Armv7)) {
-                    format!("{env}eabihf")
+                // If we've detected a bare `gnu` or `musl` environment on ARMv7,
+                // that means our floating point environment detection failed.
+                // We currently assume hard-float in that case, for two reasons:
+                // 1. Statistically, we expect the overwhelming majority of ARMv7 Linux hosts to
+                //    be hard-float.
+                // 2. We currently only ship hard-float ARMv7 builds of ruff and uv anyways,
+                //    so we don't even have a soft-float build to fall back to.
+                // By contrast, we *do* ship soft-float Python builds via PBS, but PBS
+                // installations don't take this pathway.
+                if matches!(arch.family(), Architecture::Arm(ArmArchitecture::Armv7))
+                    && matches!(env, Environment::Gnu | Environment::Musl)
+                {
+                    Cow::Owned(format!("{env}eabihf"))
                 } else {
-                    env.to_string()
+                    Cow::Owned(env.to_string())
                 }
             }),
             _ => None,
@@ -207,47 +220,7 @@ impl Ord for Platform {
             .to_string()
             .cmp(&other.os.to_string())
             // Then architecture
-            .then_with(|| {
-                if self.arch.family == other.arch.family {
-                    return self.arch.variant.cmp(&other.arch.variant);
-                }
-
-                // For the time being, manually make aarch64 windows disfavored on its own host
-                // platform, because most packages don't have wheels for aarch64 windows, making
-                // emulation more useful than native execution!
-                //
-                // The reason we do this in "sorting" and not "supports" is so that we don't
-                // *refuse* to use an aarch64 windows pythons if they happen to be installed and
-                // nothing else is available.
-                //
-                // Similarly if someone manually requests an aarch64 windows install, we should
-                // respect that request (this is the way users should "override" this behaviour).
-                let preferred = if self.os.is_windows() {
-                    Arch {
-                        family: target_lexicon::Architecture::X86_64,
-                        variant: None,
-                    }
-                } else {
-                    // Prefer native architectures
-                    Arch::from_env()
-                };
-
-                match (
-                    self.arch.family == preferred.family,
-                    other.arch.family == preferred.family,
-                ) {
-                    (true, true) => unreachable!(),
-                    (true, false) => cmp::Ordering::Less,
-                    (false, true) => cmp::Ordering::Greater,
-                    (false, false) => {
-                        // Both non-preferred, fallback to lexicographic order
-                        self.arch
-                            .family
-                            .to_string()
-                            .cmp(&other.arch.family.to_string())
-                    }
-                }
-            })
+            .then_with(|| self.arch.cmp_for_os(other.arch, self.os, Arch::from_env()))
             // Finally compare libc
             .then_with(|| self.libc.to_string().cmp(&other.libc.to_string()))
     }
@@ -422,43 +395,32 @@ mod tests {
 
     #[test]
     fn test_windows_aarch64_platform_sorting() {
-        // Test that on Windows, x86_64 is preferred over aarch64
-        let windows_x86_64 = Platform::from_str("windows-x86_64-none").unwrap();
-        let windows_aarch64 = Platform::from_str("windows-aarch64-none").unwrap();
+        use crate::arch::test_support::{aarch64, run_with_arch};
 
-        // x86_64 should sort before aarch64 on Windows (preferred)
-        assert!(windows_x86_64 < windows_aarch64);
-
-        // Test with multiple Windows platforms
         let mut platforms = [
             Platform::from_str("windows-aarch64-none").unwrap(),
             Platform::from_str("windows-x86_64-none").unwrap(),
             Platform::from_str("windows-x86-none").unwrap(),
         ];
 
-        platforms.sort();
+        run_with_arch(aarch64(), || platforms.sort());
 
-        // After sorting on Windows, the order should be: x86_64 (preferred), aarch64, x86
-        // x86_64 is preferred on Windows regardless of native architecture
-        assert_eq!(platforms[0].arch.to_string(), "x86_64");
-        assert_eq!(platforms[1].arch.to_string(), "aarch64");
+        assert_eq!(platforms[0].arch.to_string(), "aarch64");
+        assert_eq!(platforms[1].arch.to_string(), "x86_64");
         assert_eq!(platforms[2].arch.to_string(), "x86");
     }
 
     #[test]
-    fn test_windows_sorting_always_prefers_x86_64() {
-        // Test that Windows always prefers x86_64 regardless of host architecture
+    fn test_windows_sorting_prefers_native_arch() {
         use crate::arch::test_support::{aarch64, run_with_arch, x86_64};
 
         let windows_x86_64 = Platform::from_str("windows-x86_64-none").unwrap();
         let windows_aarch64 = Platform::from_str("windows-aarch64-none").unwrap();
 
-        // Even with aarch64 as host, Windows should still prefer x86_64
         run_with_arch(aarch64(), || {
-            assert!(windows_x86_64 < windows_aarch64);
+            assert!(windows_aarch64 < windows_x86_64);
         });
 
-        // With x86_64 as host, Windows should still prefer x86_64
         run_with_arch(x86_64(), || {
             assert!(windows_x86_64 < windows_aarch64);
         });
@@ -507,5 +469,33 @@ mod tests {
         assert_eq!(platform_linux.os.to_string(), "linux");
         assert_eq!(platform_linux.arch.to_string(), "aarch64");
         assert_eq!(platform_linux.libc.to_string(), "gnu");
+    }
+
+    #[test]
+    fn test_as_cargo_dist_triple_armv7_libc_handling() {
+        // This mapping reflects our current behavior: we currently ship
+        // only hard-float artifacts for ARMv7, so if we fail to detect
+        // the float ABI (i.e., we get the generic `Gnu` or `Musl`),
+        // we assume hard-float.
+        for (arch, libc, expected) in [
+            // ARMv7: detected ABI passes through unchanged.
+            ("armv7", "gnueabihf", "armv7-unknown-linux-gnueabihf"),
+            ("armv7", "gnueabi", "armv7-unknown-linux-gnueabi"),
+            ("armv7", "musleabihf", "armv7-unknown-linux-musleabihf"),
+            ("armv7", "musleabi", "armv7-unknown-linux-musleabi"),
+            // ARMv7: generic libc (detection failure) is biased to hard-float.
+            ("armv7", "gnu", "armv7-unknown-linux-gnueabihf"),
+            ("armv7", "musl", "armv7-unknown-linux-musleabihf"),
+            // Non-ARMv7: libc passes through unchanged.
+            ("aarch64", "gnu", "aarch64-unknown-linux-gnu"),
+            ("x86_64", "musl", "x86_64-unknown-linux-musl"),
+        ] {
+            let platform = Platform::from_parts("linux", arch, libc).unwrap();
+            assert_eq!(
+                platform.as_cargo_dist_triple(),
+                expected,
+                "linux-{arch}-{libc}"
+            );
+        }
     }
 }

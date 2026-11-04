@@ -2,7 +2,6 @@
 //! [PEP 639](https://packaging.python.org/en/latest/specifications/glob-patterns/).
 
 use globset::{Glob, GlobBuilder};
-use owo_colors::OwoColorize;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -11,43 +10,50 @@ pub enum PortableGlobError {
     #[error(transparent)]
     GlobError(#[from] globset::Error),
     #[error(
-        "The parent directory operator (`..`) at position {pos} is not allowed in glob: `{glob}`"
+        "The parent directory operator (`..`) at position {pos} is not allowed in glob `{glob}`"
     )]
     ParentDirectory { glob: String, pos: usize },
-    #[error("Invalid character `{invalid}` at position {pos} in glob: `{glob}`")]
+    #[error("Invalid character `{invalid}` at position {pos} in glob `{glob}`")]
     InvalidCharacter {
         glob: String,
         pos: usize,
         invalid: char,
     },
-    #[error(
-        "Invalid character `{invalid}` at position {pos} in glob: `{glob}`. {}{} Characters can be escaped with a backslash",
-        "hint".bold().cyan(),
-        ":".bold()
-    )]
+    #[error("Invalid character `{invalid}` at position {pos} in glob `{glob}`")]
     InvalidCharacterUv {
         glob: String,
         pos: usize,
         invalid: char,
     },
     #[error(
-        "Only forward slashes are allowed as path separator, invalid character at position {pos} in glob: `{glob}`"
+        "Only forward slashes are allowed as path separator, invalid character at position {pos} in glob `{glob}`"
     )]
     InvalidBackslash { glob: String, pos: usize },
     #[error(
-        "Path separators can't be escaped, invalid character at position {pos} in glob: `{glob}`"
+        "Path separators can't be escaped, invalid character at position {pos} in glob `{glob}`"
     )]
     InvalidEscapee { glob: String, pos: usize },
-    #[error("Invalid character `{invalid}` in range at position {pos} in glob: `{glob}`")]
+    #[error("Invalid character `{invalid}` in range at position {pos} in glob `{glob}`")]
     InvalidCharacterRange {
         glob: String,
         pos: usize,
         invalid: char,
     },
-    #[error("Too many at stars at position {pos} in glob: `{glob}`")]
+    #[error("Too many at stars at position {pos} in glob `{glob}`")]
     TooManyStars { glob: String, pos: usize },
-    #[error("Trailing backslash at position {pos} in glob: `{glob}`")]
+    #[error("Trailing backslash at position {pos} in glob `{glob}`")]
     TrailingEscape { glob: String, pos: usize },
+}
+
+impl uv_errors::Hinted for PortableGlobError {
+    fn hints(&self) -> uv_errors::Hints<'_> {
+        match self {
+            Self::InvalidCharacterUv { .. } => {
+                uv_errors::Hints::from("Characters can be escaped with a backslash")
+            }
+            _ => uv_errors::Hints::none(),
+        }
+    }
 }
 
 /// Cross-language glob syntax from
@@ -100,7 +106,7 @@ impl PortableGlobParser {
     }
 
     /// See [`parse_portable_glob`].
-    pub fn check(&self, glob: &str) -> Result<(), PortableGlobError> {
+    fn check(self, glob: &str) -> Result<(), PortableGlobError> {
         let mut chars = glob.chars().enumerate().peekable();
         // A `..` is on a parent directory indicator at the start of the string or after a directory
         // separator.
@@ -217,6 +223,7 @@ impl PortableGlobParser {
 mod tests {
     use super::*;
     use insta::assert_snapshot;
+    use uv_errors::{ErrorWithHints, Hinted};
 
     #[test]
     fn test_error() {
@@ -226,65 +233,70 @@ mod tests {
         };
         assert_snapshot!(
             parse_err(".."),
-            @"The parent directory operator (`..`) at position 0 is not allowed in glob: `..`"
+            @"The parent directory operator (`..`) at position 0 is not allowed in glob `..`"
         );
         assert_snapshot!(
             parse_err("licenses/.."),
-            @"The parent directory operator (`..`) at position 9 is not allowed in glob: `licenses/..`"
+            @"The parent directory operator (`..`) at position 9 is not allowed in glob `licenses/..`"
         );
         assert_snapshot!(
             parse_err("licenses/LICEN!E.txt"),
-            @"Invalid character `!` at position 14 in glob: `licenses/LICEN!E.txt`"
+            @"Invalid character `!` at position 14 in glob `licenses/LICEN!E.txt`"
         );
         assert_snapshot!(
             parse_err("licenses/LICEN[!C]E.txt"),
-            @"Invalid character `!` in range at position 15 in glob: `licenses/LICEN[!C]E.txt`"
+            @"Invalid character `!` in range at position 15 in glob `licenses/LICEN[!C]E.txt`"
         );
         assert_snapshot!(
             parse_err("licenses/LICEN[C?]E.txt"),
-            @"Invalid character `?` in range at position 16 in glob: `licenses/LICEN[C?]E.txt`"
+            @"Invalid character `?` in range at position 16 in glob `licenses/LICEN[C?]E.txt`"
         );
         assert_snapshot!(
             parse_err("******"),
-            @"Too many at stars at position 0 in glob: `******`"
+            @"Too many at stars at position 0 in glob `******`"
         );
         assert_snapshot!(
             parse_err("licenses/**license"),
-            @"Too many at stars at position 9 in glob: `licenses/**license`"
+            @"Too many at stars at position 9 in glob `licenses/**license`"
         );
         assert_snapshot!(
             parse_err("licenses/***/licenses.csv"),
-            @"Too many at stars at position 9 in glob: `licenses/***/licenses.csv`"
+            @"Too many at stars at position 9 in glob `licenses/***/licenses.csv`"
         );
         assert_snapshot!(
             parse_err(r"licenses\eula.txt"),
-            @r"Only forward slashes are allowed as path separator, invalid character at position 8 in glob: `licenses\eula.txt`"
+            @r"Only forward slashes are allowed as path separator, invalid character at position 8 in glob `licenses\eula.txt`"
         );
         assert_snapshot!(
             parse_err(r"**/@test"),
-            @"Invalid character `@` at position 3 in glob: `**/@test`"
+            @"Invalid character `@` at position 3 in glob `**/@test`"
         );
         // Escapes are not allowed in strict PEP 639 mode
         assert_snapshot!(
             parse_err(r"public domain/Gulliver\\’s Travels.txt"),
-            @r"Invalid character ` ` at position 6 in glob: `public domain/Gulliver\\’s Travels.txt`"
+            @r"Invalid character ` ` at position 6 in glob `public domain/Gulliver\\’s Travels.txt`"
         );
         let parse_err_uv = |glob| {
             let error = PortableGlobParser::Uv.parse(glob).unwrap_err();
-            anstream::adapter::strip_str(&error.to_string()).to_string()
+            let formatted = ErrorWithHints::new(error.to_string(), error.hints()).to_string();
+            anstream::adapter::strip_str(&formatted).to_string()
         };
         assert_snapshot!(
             parse_err_uv(r"**/@test"),
-            @"Invalid character `@` at position 3 in glob: `**/@test`. hint: Characters can be escaped with a backslash"
+            @r"
+        Invalid character `@` at position 3 in glob `**/@test`
+
+        hint: Characters can be escaped with a backslash
+        "
         );
         // Escaping slashes is not allowed.
         assert_snapshot!(
             parse_err_uv(r"licenses\\MIT.txt"),
-            @r"Path separators can't be escaped, invalid character at position 9 in glob: `licenses\\MIT.txt`"
+            @r"Path separators can't be escaped, invalid character at position 9 in glob `licenses\\MIT.txt`"
         );
         assert_snapshot!(
             parse_err_uv(r"licenses\/MIT.txt"),
-            @r"Path separators can't be escaped, invalid character at position 9 in glob: `licenses\/MIT.txt`"
+            @r"Path separators can't be escaped, invalid character at position 9 in glob `licenses\/MIT.txt`"
         );
     }
 

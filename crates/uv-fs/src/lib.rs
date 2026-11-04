@@ -1,21 +1,139 @@
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
+#[cfg(target_os = "linux")]
+use std::time::{Duration, UNIX_EPOCH};
 
 #[cfg(feature = "tokio")]
 use std::io::Read;
 
 #[cfg(feature = "tokio")]
 use encoding_rs_io::DecodeReaderBytes;
-use tempfile::NamedTempFile;
-use tracing::warn;
+#[cfg(target_os = "linux")]
+use rustix::fs::{AtFlags, CWD as RUSTIX_CWD, StatxFlags, statx};
+#[cfg(feature = "tokio")]
+use tokio::io::AsyncWriteExt;
+use tracing::{debug, warn};
+#[cfg(windows)]
+use windows::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
 
 pub use crate::locked_file::*;
+#[cfg(feature = "tokio")]
+use crate::named_temp_file::tempfile_in_with_permissions;
+pub use crate::named_temp_file::{NamedTempFile, PersistError, tempfile_in};
 pub use crate::path::*;
+pub use crate::read::ValidatedReader;
+pub use crate::space::{PhysicalSpaceError, physical_space, supports_fine_grained_accounting};
 
 pub mod cachedir;
+#[cfg(target_os = "macos")]
+mod hardlink_macos;
 pub mod link;
 mod locked_file;
+mod named_temp_file;
 mod path;
+mod read;
+mod space;
 pub mod which;
+
+/// Return the number of hardlinks to a file.
+#[cfg(unix)]
+pub fn hardlink_count(path: &Path) -> io::Result<u64> {
+    Ok(fs_err::metadata(path)?.nlink())
+}
+
+/// Return the number of hardlinks to a file.
+#[cfg(windows)]
+#[expect(unsafe_code)]
+pub fn hardlink_count(path: &Path) -> io::Result<u64> {
+    let file = fs_err::File::open(path)?;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: The file handle remains open for the duration of the call, and `information`
+    // points to a valid, writable structure of the type expected by the Windows API.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &raw mut information) }?;
+    Ok(u64::from(information.nNumberOfLinks))
+}
+
+/// Return an error on platforms that cannot report hardlink counts.
+#[cfg(not(any(unix, windows)))]
+pub fn hardlink_count(_path: &Path) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "hardlink counts are not supported on this platform",
+    ))
+}
+
+/// Collect regular files whose only hardlink is their entry in this directory.
+///
+/// Ignores symlink entries and uses bulk metadata reads on macOS. Returns `None` when the fast path
+/// is unavailable, required attributes are missing, or subdirectories need a recursive walk.
+/// No candidates are returned unless the entire directory can use the fast path.
+///
+/// Callers deleting these files must prevent concurrent changes to the directory and hardlink
+/// counts throughout both the scan and deletion.
+pub fn files_with_one_hardlink(path: &Path) -> io::Result<Option<Vec<PathBuf>>> {
+    #[cfg(target_os = "macos")]
+    {
+        hardlink_macos::files_with_one_hardlink(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
+/// Return a path's creation time, including on Linux targets where [`std::fs::Metadata::created`]
+/// does not expose the filesystem birth time.
+pub fn created_time(path: &Path, metadata: &std::fs::Metadata) -> io::Result<SystemTime> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = metadata;
+
+        let metadata = statx(
+            RUSTIX_CWD,
+            path,
+            AtFlags::empty(),
+            StatxFlags::BASIC_STATS | StatxFlags::BTIME,
+        )?;
+
+        if metadata.stx_mask & StatxFlags::BTIME.bits() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "creation time is not available for the filesystem",
+            ));
+        }
+
+        let birth_time = metadata.stx_btime;
+        let seconds = Duration::from_secs(birth_time.tv_sec.unsigned_abs());
+        let created = if birth_time.tv_sec < 0 {
+            UNIX_EPOCH.checked_sub(seconds)
+        } else {
+            UNIX_EPOCH.checked_add(seconds)
+        };
+
+        created
+            .filter(|_| birth_time.tv_nsec < 1_000_000_000)
+            .and_then(|created| {
+                created.checked_add(Duration::from_nanos(u64::from(birth_time.tv_nsec)))
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid creation time"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        metadata.created()
+    }
+}
 
 /// Attempt to check if the two paths refer to the same file.
 ///
@@ -56,66 +174,156 @@ pub fn is_same_file_allow_missing(left: &Path, right: &Path) -> Option<bool> {
 ///
 /// This should generally only be used when one specifically wants to support reading UTF-16
 /// transparently.
-///
-/// If the file path is `-`, then contents are read from stdin instead.
 #[cfg(feature = "tokio")]
 pub async fn read_to_string_transcode(path: impl AsRef<Path>) -> std::io::Result<String> {
     let path = path.as_ref();
-    let raw = if path == Path::new("-") {
-        let mut buf = Vec::with_capacity(1024);
-        std::io::stdin().read_to_end(&mut buf)?;
-        buf
-    } else {
-        fs_err::tokio::read(path).await?
-    };
+    let raw = fs_err::tokio::read(path).await?;
+    transcode_to_string(&raw, &format!("file `{}`", path.display()))
+}
+
+/// Reads data from stdin and requires that it be valid UTF-8 or UTF-16.
+///
+/// This uses BOM sniffing to determine if the data should be transcoded from UTF-16 to Rust's
+/// `String` type (which uses UTF-8).
+#[cfg(feature = "tokio")]
+pub fn read_stdin_to_string_transcode() -> std::io::Result<String> {
+    let mut raw = Vec::with_capacity(1024);
+    std::io::stdin().read_to_end(&mut raw)?;
+    transcode_to_string(&raw, "stdin")
+}
+
+#[cfg(feature = "tokio")]
+fn transcode_to_string(raw: &[u8], source: &str) -> std::io::Result<String> {
+    // The decoder needs three bytes to detect a BOM, so handle empty UTF-16 files explicitly.
+    if raw == [0xff, 0xfe] || raw == [0xfe, 0xff] {
+        return Ok(String::new());
+    }
     let mut buf = String::with_capacity(1024);
-    DecodeReaderBytes::new(&*raw)
+    DecodeReaderBytes::new(raw)
         .read_to_string(&mut buf)
-        .map_err(|err| {
-            let path = path.display();
-            std::io::Error::other(format!("failed to decode file {path}: {err}"))
-        })?;
+        .map_err(|err| std::io::Error::other(format!("failed to decode {source}: {err}")))?;
     Ok(buf)
 }
 
-/// Create a symlink at `dst` pointing to `src`, replacing any existing symlink.
+/// Create a junction at `path` pointing to `target`.
 ///
-/// On Windows, this uses the `junction` crate to create a junction point. The
-/// operation is _not_ atomic, as we first delete the junction, then create a
-/// junction at the same path.
+/// Junctions can be silently broken when involving network paths or non-NTFS filesystems.
 ///
-/// Note that because junctions are used, the source must be a directory.
+/// If creation fails but leaves behind an empty directory, it is cleaned up and the original
+/// creation error is propagated.
+#[cfg(windows)]
+fn create_junction(target: &Path, path: &Path) -> std::io::Result<()> {
+    use windows::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, ERROR_INVALID_NAME, ERROR_INVALID_PARAMETER,
+        ERROR_INVALID_REPARSE_DATA, ERROR_NOT_A_REPARSE_POINT, WIN32_ERROR,
+    };
+
+    let create_result = junction::create(target, path);
+
+    match path.metadata() {
+        Ok(_) if create_result.is_ok() => Ok(()),
+        Ok(_) => {
+            // Creation failed but left behind an empty directory. Only clean
+            // it up if the directory wasn't already there before we tried.
+            if let Err(ref create_err) = create_result {
+                if !matches!(
+                    create_err
+                        .raw_os_error()
+                        .map(|err| WIN32_ERROR(err.cast_unsigned())),
+                    Some(ERROR_ALREADY_EXISTS)
+                ) {
+                    // Not a junction (metadata succeeded normally), just
+                    // an empty directory left behind by junction::create.
+                    let _ = fs_err::remove_dir(path);
+                }
+            }
+            create_result
+        }
+        Err(err)
+            if matches!(
+                err.raw_os_error()
+                    .map(|err| WIN32_ERROR(err.cast_unsigned())),
+                Some(
+                    ERROR_INVALID_PARAMETER
+                        | ERROR_INVALID_NAME
+                        | ERROR_NOT_A_REPARSE_POINT
+                        | ERROR_INVALID_REPARSE_DATA
+                )
+            ) =>
+        {
+            // Broken reparse point.
+            let _ = fs_err::remove_dir(path);
+            Err(create_result.err().unwrap_or(err))
+        }
+        Err(err) => Err(create_result.err().unwrap_or(err)),
+    }
+}
+
+/// Create a directory link at `dst` pointing to `src`, replacing any existing link.
+///
+/// On Windows, this normally creates an NTFS junction, since junctions don't
+/// require elevated privileges. When running under Wine, which doesn't implement
+/// the reparse-point ioctl that junction creation depends on, this transparently
+/// creates a Windows directory symbolic link instead via `CreateSymbolicLinkW`
+/// (Wine maps that to a Unix symlink, so it succeeds without privileges).
+///
+/// The operation is _not_ atomic: any existing entry at `dst` is removed first,
+/// then the new link is created at the same path.
+///
+/// Note that the source must be a directory.
 ///
 /// Changes to this function should be reflected in [`create_symlink`].
 #[cfg(windows)]
 pub fn replace_symlink(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
-    // If the source is a file, we can't create a junction
-    if src.as_ref().is_file() {
+    let src = src.as_ref();
+    let dst = dst.as_ref();
+
+    if src.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "Cannot create a junction for {}: is not a directory",
-                src.as_ref().display()
+                "Cannot create a directory link for `{}`: is not a directory",
+                src.display()
             ),
         ));
     }
 
-    // Remove the existing symlink, if any.
-    match junction::delete(dunce::simplified(dst.as_ref())) {
-        Ok(()) => match fs_err::remove_dir_all(dst.as_ref()) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
-        },
+    if uv_windows::is_wine() {
+        replace_with_symlink_dir(src, dst)
+    } else {
+        replace_with_junction(src, dst)
+    }
+}
+
+#[cfg(windows)]
+fn replace_with_junction(src: &Path, dst: &Path) -> std::io::Result<()> {
+    // Remove the existing junction, if any.
+    match fs_err::remove_dir(dst) {
+        Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
 
-    // Replace it with a new symlink.
-    junction::create(
-        dunce::simplified(src.as_ref()),
-        dunce::simplified(dst.as_ref()),
-    )
+    // Replace it with a new junction.
+    create_junction(src, dst)
+}
+
+#[cfg(windows)]
+fn replace_with_symlink_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    // Best-effort removal of any existing entry. The destination may be a
+    // directory, file, or symlink, so try the directory removal first and
+    // fall back to file removal if that fails.
+    match fs_err::remove_dir_all(dst) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => match fs_err::remove_file(dst) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        },
+    }
+
+    fs_err::os::windows::fs::symlink_dir(dunce::simplified(src), dunce::simplified(dst))
 }
 
 /// Create a symlink at `dst` pointing to `src`, replacing any existing symlink if necessary.
@@ -123,17 +331,16 @@ pub fn replace_symlink(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io:
 /// On Unix, this method creates a temporary file, then moves it into place.
 #[cfg(unix)]
 pub fn replace_symlink(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
-    // Attempt to create the symlink directly.
     match fs_err::os::unix::fs::symlink(src.as_ref(), dst.as_ref()) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Create a symlink, using a temporary file to ensure atomicity.
-            let temp_dir = tempfile::tempdir_in(dst.as_ref().parent().unwrap())?;
-            let temp_file = temp_dir.path().join("link");
-            fs_err::os::unix::fs::symlink(src, &temp_file)?;
-
-            // Move the symlink into the target location.
-            fs_err::rename(&temp_file, dst.as_ref())?;
+            let temp_file = tempfile::Builder::new().make_in(
+                dst.as_ref()
+                    .parent()
+                    .expect("Symlink path must have a parent"),
+                |path| fs_err::os::unix::fs::symlink(src.as_ref(), path),
+            )?;
+            fs_err::rename(temp_file.path(), dst.as_ref())?;
 
             Ok(())
         }
@@ -141,30 +348,35 @@ pub fn replace_symlink(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io:
     }
 }
 
-/// Create a symlink at `dst` pointing to `src`.
+/// Create a directory link at `dst` pointing to `src`.
 ///
-/// On Windows, this uses the `junction` crate to create a junction point.
+/// On Windows, this normally creates an NTFS junction, falling back to a Windows
+/// directory symbolic link when running under Wine. See [`replace_symlink`] for
+/// the rationale.
 ///
-/// Note that because junctions are used, the source must be a directory.
+/// Note that the source must be a directory.
 ///
 /// Changes to this function should be reflected in [`replace_symlink`].
 #[cfg(windows)]
 pub fn create_symlink(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
-    // If the source is a file, we can't create a junction
-    if src.as_ref().is_file() {
+    let src = src.as_ref();
+    let dst = dst.as_ref();
+
+    if src.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "Cannot create a junction for {}: is not a directory",
-                src.as_ref().display()
+                "Cannot create a directory link for `{}`: is not a directory",
+                src.display()
             ),
         ));
     }
 
-    junction::create(
-        dunce::simplified(src.as_ref()),
-        dunce::simplified(dst.as_ref()),
-    )
+    if uv_windows::is_wine() {
+        fs_err::os::windows::fs::symlink_dir(dunce::simplified(src), dunce::simplified(dst))
+    } else {
+        create_junction(src, dst)
+    }
 }
 
 /// Create a symlink at `dst` pointing to `src`.
@@ -173,9 +385,84 @@ pub fn create_symlink(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::
     fs_err::os::unix::fs::symlink(src.as_ref(), dst.as_ref())
 }
 
-#[cfg(unix)]
-pub fn remove_symlink(path: impl AsRef<Path>) -> std::io::Result<()> {
-    fs_err::remove_file(path.as_ref())
+/// Remove a symbolic link at `path` without following its target.
+pub fn remove_symlink(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref();
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+
+        if fs_err::symlink_metadata(path)?.file_type().is_symlink_dir() {
+            return fs_err::remove_dir(path);
+        }
+    }
+
+    fs_err::remove_file(path)
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::assert_matches;
+    use std::os::windows::ffi::OsStrExt;
+
+    use super::*;
+
+    #[test]
+    fn fs_err_read_link_reads_created_directory_link() -> std::io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let target = tempdir.path().join("target");
+        fs_err::create_dir(&target)?;
+        let link = tempdir.path().join("link");
+
+        create_symlink(&target, &link)?;
+
+        assert_eq!(
+            verbatim_path(&fs_err::read_link(&link)?),
+            verbatim_path(&target)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fs_err_read_link_reads_long_junction_target() -> std::io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let mut target = tempdir.path().join("target");
+        while target.as_os_str().encode_wide().count() < 257 {
+            target.push("long-path-component");
+        }
+        fs_err::create_dir_all(&target)?;
+        let link = tempdir.path().join("link");
+
+        create_symlink(&target, &link)?;
+
+        let link_target = fs_err::read_link(&link)?;
+        assert_eq!(verbatim_path(&link_target), verbatim_path(&target));
+        Ok(())
+    }
+
+    #[test]
+    fn create_junction_from_smb_failure_removes_directory() -> std::io::Result<()> {
+        #[expect(clippy::print_stderr)]
+        let Some(smb_fs) = std::env::var(uv_static::EnvVars::UV_INTERNAL__TEST_SMB_FS).ok() else {
+            eprintln!("Skipping: UV_INTERNAL__TEST_SMB_FS not set");
+            return Ok(());
+        };
+        fs_err::create_dir_all(&smb_fs)?;
+        let alt_tempdir = tempfile::tempdir_in(smb_fs)?;
+        let tempdir = tempfile::tempdir()?;
+        let link = tempdir.path().join("link");
+        let target = alt_tempdir.path().join("target");
+        fs_err::create_dir(&target)?;
+
+        let err = create_junction(&target, &link).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidFilename);
+        assert_matches!(
+            fs_err::symlink_metadata(&link),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound
+        );
+        Ok(())
+    }
 }
 
 /// Create a symlink at `dst` pointing to `src` on Unix or copy `src` to `dst` on Windows
@@ -187,47 +474,16 @@ pub fn remove_symlink(path: impl AsRef<Path>) -> std::io::Result<()> {
 /// This function should only be used for files. If targeting a directory, use [`replace_symlink`]
 /// instead; it will use a junction on Windows, which is more performant.
 pub fn symlink_or_copy_file(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        fs_err::copy(src.as_ref(), dst.as_ref())?;
-    }
-    #[cfg(unix)]
-    {
-        fs_err::os::unix::fs::symlink(src.as_ref(), dst.as_ref())?;
+    cfg_select! {
+        windows => {
+            fs_err::copy(src.as_ref(), dst.as_ref())?;
+        },
+        unix => {
+            fs_err::os::unix::fs::symlink(src.as_ref(), dst.as_ref())?;
+        },
     }
 
     Ok(())
-}
-
-#[cfg(windows)]
-pub fn remove_symlink(path: impl AsRef<Path>) -> std::io::Result<()> {
-    match junction::delete(dunce::simplified(path.as_ref())) {
-        Ok(()) => match fs_err::remove_dir_all(path.as_ref()) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
-/// Return a [`NamedTempFile`] in the specified directory.
-///
-/// Sets the permissions of the temporary file to `0o666`, to match the non-temporary file default.
-/// ([`NamedTempfile`] defaults to `0o600`.)
-#[cfg(unix)]
-pub fn tempfile_in(path: &Path) -> std::io::Result<NamedTempFile> {
-    use std::os::unix::fs::PermissionsExt;
-    tempfile::Builder::new()
-        .permissions(std::fs::Permissions::from_mode(0o666))
-        .tempfile_in(path)
-}
-
-/// Return a [`NamedTempFile`] in the specified directory.
-#[cfg(not(unix))]
-pub fn tempfile_in(path: &Path) -> std::io::Result<NamedTempFile> {
-    tempfile::Builder::new().tempfile_in(path)
 }
 
 /// Write `data` to `path` atomically using a temporary file and atomic rename.
@@ -242,14 +498,70 @@ pub async fn write_atomic(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> std
     persist_with_retry(temp_file, path.as_ref()).await
 }
 
+/// Atomically write a user-managed file, preserving symlinks and the target's permissions.
+///
+/// Replacement requires write access to the target directory, even if the file itself is
+/// writable. A missing symlink target is created when its parent directory exists.
+/// Existing targets must be regular files.
+#[cfg(feature = "tokio")]
+pub async fn write_atomic_preserve(
+    path: impl AsRef<Path>,
+    data: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    let mut path = path.as_ref().to_path_buf();
+    let permissions = loop {
+        match fs_err::tokio::symlink_metadata(&path).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                path = match fs_err::tokio::canonicalize(&path).await {
+                    Ok(target) => target,
+                    // Canonicalization resolves live links and catches cycles. For a dangling
+                    // chain, follow its next link and let the OS check the remaining path.
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        let target = fs_err::tokio::read_link(&path).await?;
+                        path.parent()
+                            .expect("Write path must have a parent")
+                            .join(target)
+                    }
+                    Err(err) => return Err(err),
+                };
+            }
+            Ok(metadata) if metadata.is_file() => break Some(metadata.permissions()),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Cannot atomically replace `{}`: not a regular file",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break None,
+            Err(err) => return Err(err),
+        }
+    };
+    let parent = path.parent().expect("Write path must have a parent");
+    let temp_file = tempfile_in_with_permissions(parent, permissions.clone())?;
+    // Write through the open handle: the umask may prevent reopening the temporary file.
+    let mut file = fs_err::tokio::File::from_std(fs_err::File::from_parts(
+        temp_file.as_file().try_clone()?,
+        temp_file.as_ref(),
+    ));
+    file.write_all(data.as_ref()).await?;
+    file.flush().await?;
+    if let Some(permissions) = permissions {
+        temp_file.as_file().set_permissions(permissions)?;
+    }
+    persist_with_retry(temp_file, path).await
+}
+
 /// Write `data` to `path` atomically using a temporary file and atomic rename.
 pub fn write_atomic_sync(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> std::io::Result<()> {
-    let temp_file = tempfile_in(
+    let mut temp_file = tempfile_in(
         path.as_ref()
             .parent()
             .expect("Write path must have a parent"),
     )?;
-    fs_err::write(&temp_file, &data)?;
+    temp_file.write_all(data.as_ref())?;
     persist_with_retry_sync(temp_file, path.as_ref())
 }
 
@@ -299,7 +611,7 @@ pub async fn rename_with_retry(
             .when(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
             .notify(|err, _dur| {
                 warn!(
-                    "Retrying rename from {} to {} due to transient error: {}",
+                    "Retrying rename from `{}` to `{}` due to transient error: {}",
                     from.display(),
                     to.display(),
                     err
@@ -340,7 +652,7 @@ pub fn with_retry_sync(
             .when(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
             .notify(|err, _dur| {
                 warn!(
-                    "Retrying {} from {} to {} due to transient error: {}",
+                    "Retrying {} from `{}` to `{}` due to transient error: {}",
                     operation_name,
                     from.display(),
                     to.display(),
@@ -349,13 +661,16 @@ pub fn with_retry_sync(
             })
             .call()
             .map_err(|err| {
-                std::io::Error::other(format!(
-                    "Failed {} {} to {}: {}",
-                    operation_name,
-                    from.display(),
-                    to.display(),
-                    err
-                ))
+                std::io::Error::new(
+                    err.kind(),
+                    format!(
+                        "Failed {} `{}` to `{}`: {}",
+                        operation_name,
+                        from.display(),
+                        to.display(),
+                        err
+                    ),
+                )
             })
     }
     #[cfg(not(windows))]
@@ -376,7 +691,7 @@ enum PersistRetryError {
 /// Persist a `NamedTempFile`, retrying (on Windows) if it fails due to transient operating system
 /// errors.
 #[cfg(feature = "tokio")]
-pub async fn persist_with_retry(
+async fn persist_with_retry(
     from: NamedTempFile,
     to: impl AsRef<Path>,
 ) -> Result<(), std::io::Error> {
@@ -443,7 +758,7 @@ pub async fn persist_with_retry(
             .notify(|err, _dur| {
                 if let PersistRetryError::Persist(error_message) = err {
                     warn!(
-                        "Retrying to persist temporary file to {}: {}",
+                        "Retrying to persist temporary file to `{}`: {}",
                         to.display(),
                         error_message,
                     );
@@ -454,12 +769,12 @@ pub async fn persist_with_retry(
         match persisted {
             Ok(_) => Ok(()),
             Err(PersistRetryError::Persist(error_message)) => Err(std::io::Error::other(format!(
-                "Failed to persist temporary file to {}: {}",
+                "Failed to persist temporary file to `{}`: {}",
                 to.display(),
                 error_message,
             ))),
             Err(PersistRetryError::LostState) => Err(std::io::Error::other(format!(
-                "Failed to retrieve temporary file while trying to persist to {}",
+                "Failed to retrieve temporary file while trying to persist to `{}`",
                 to.display()
             ))),
         }
@@ -514,7 +829,7 @@ pub fn persist_with_retry_sync(
             .notify(|err, _dur| {
                 if let PersistRetryError::Persist(error_message) = err {
                     warn!(
-                        "Retrying to persist temporary file to {}: {}",
+                        "Retrying to persist temporary file to `{}`: {}",
                         to.display(),
                         error_message,
                     );
@@ -525,12 +840,12 @@ pub fn persist_with_retry_sync(
         match persisted {
             Ok(_) => Ok(()),
             Err(PersistRetryError::Persist(error_message)) => Err(std::io::Error::other(format!(
-                "Failed to persist temporary file to {}: {}",
+                "Failed to persist temporary file to `{}`: {}",
                 to.display(),
                 error_message,
             ))),
             Err(PersistRetryError::LostState) => Err(std::io::Error::other(format!(
-                "Failed to retrieve temporary file while trying to persist to {}",
+                "Failed to retrieve temporary file while trying to persist to `{}`",
                 to.display()
             ))),
         }
@@ -644,6 +959,7 @@ pub fn is_virtualenv_base(path: impl AsRef<Path>) -> bool {
 }
 
 /// Whether the error is due to a lock being held.
+#[cfg(feature = "tokio")]
 fn is_known_already_locked_error(err: &std::fs::TryLockError) -> bool {
     match err {
         std::fs::TryLockError::WouldBlock => true,
@@ -704,4 +1020,218 @@ pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Re
         }
     }
     Ok(())
+}
+
+/// Perform a safe removal of a virtual environment.
+///
+/// The link or file at `location` is removed without following it.
+pub fn remove_virtualenv(location: &Path) -> io::Result<()> {
+    if !fs_err::symlink_metadata(location)?.is_dir() {
+        return remove_symlink(location);
+    }
+
+    // On Windows, if the current executable is in the directory, defer self-deletion since Windows
+    // won't let you unlink a running executable.
+    #[cfg(windows)]
+    if let Ok(itself) = std::env::current_exe() {
+        let target = std::path::absolute(location)?;
+        if itself.starts_with(&target) {
+            debug!("Detected self-delete of executable: {}", itself.display());
+            self_replace::self_delete_outside_path(location)?;
+        }
+    }
+
+    // We defer removal of the `pyvenv.cfg` until the end, so if we fail to remove the environment,
+    // uv can still identify it as a Python virtual environment that can be deleted.
+    for entry in fs_err::read_dir(location)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == location.join("pyvenv.cfg") {
+            continue;
+        }
+        if path.is_dir() {
+            fs_err::remove_dir_all(&path)?;
+        } else {
+            fs_err::remove_file(&path)?;
+        }
+    }
+
+    match fs_err::remove_file(location.join("pyvenv.cfg")) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    // Remove the virtual environment directory itself
+    match fs_err::remove_dir_all(location) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        // If the virtual environment is a mounted file system, e.g., in a Docker container, we
+        // cannot delete it — but that doesn't need to be a fatal error
+        Err(err) if err.kind() == io::ErrorKind::ResourceBusy => {
+            debug!(
+                "Skipping removal of `{}` directory due to {err}",
+                location.display(),
+            );
+        }
+        Err(err) => return Err(err),
+    }
+
+    Ok(())
+}
+
+/// Prepare an empty virtual environment directory, resolving links when possible.
+///
+/// Returns whether an existing entry was found.
+pub fn clear_virtualenv(location: &Path) -> io::Result<bool> {
+    let location = location
+        .canonicalize()
+        .unwrap_or_else(|_| location.to_path_buf());
+    let cleared = match remove_virtualenv(&location) {
+        Ok(()) => true,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+        Err(err) => return Err(err),
+    };
+    fs_err::create_dir_all(location)?;
+    Ok(cleared)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::assert_matches;
+    #[cfg(all(unix, feature = "tokio"))]
+    use std::os::unix::fs::FileTypeExt;
+    #[cfg(all(unix, feature = "tokio"))]
+    use std::os::unix::net::UnixListener;
+
+    use super::*;
+
+    #[cfg(all(unix, feature = "tokio"))]
+    #[tokio::test]
+    async fn write_atomic_preserve_rejects_special_file() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let path = tempdir.path().join("socket");
+        let _listener = UnixListener::bind(&path)?;
+
+        let error = write_atomic_preserve(&path, "contents")
+            .await
+            .expect_err("A socket cannot be atomically replaced");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(fs_err::metadata(&path)?.file_type().is_socket());
+        Ok(())
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn transcodes_bom_marked_input() -> io::Result<()> {
+        // Include a surrogate pair and an interior BOM that must remain part of the text.
+        let contents = "# café 🐍\u{feff} end\r\npackage==1.0\n";
+        let utf8 = contents.as_bytes().to_vec();
+        let utf8_bom = [b"\xef\xbb\xbf".as_slice(), contents.as_bytes()].concat();
+        let utf16_le = [0xff, 0xfe]
+            .into_iter()
+            .chain(contents.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect::<Vec<_>>();
+        let utf16_be = [0xfe, 0xff]
+            .into_iter()
+            .chain(contents.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect::<Vec<_>>();
+
+        for (source, encoded, expected) in [
+            ("utf8", utf8, contents),
+            ("utf8-bom", utf8_bom, contents),
+            ("utf16-le", utf16_le, contents),
+            ("utf16-be", utf16_be, contents),
+            ("empty", vec![], ""),
+            ("utf8-bom-only", b"\xef\xbb\xbf".to_vec(), ""),
+            ("utf16-le-bom-only", b"\xff\xfe".to_vec(), ""),
+            ("utf16-be-bom-only", b"\xfe\xff".to_vec(), ""),
+        ] {
+            assert_eq!(transcode_to_string(&encoded, source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn with_retry_sync_preserves_not_found() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let source = tempdir.path().join("missing");
+        let destination = tempdir.path().join("destination");
+        let error = with_retry_sync(&source, &destination, "renaming", || {
+            fs_err::rename(&source, &destination)
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        Ok(())
+    }
+
+    /// Requires `UV_INTERNAL__TEST_ALT_FS` on a different device from the default temp directory.
+    #[test]
+    fn with_retry_sync_preserves_cross_device_error() -> io::Result<()> {
+        let Some(alternate) = std::env::var_os(uv_static::EnvVars::UV_INTERNAL__TEST_ALT_FS) else {
+            return Ok(());
+        };
+        fs_err::create_dir_all(&alternate)?;
+        let tempdir = tempfile::tempdir()?;
+        let alternate = tempfile::tempdir_in(alternate)?;
+        let source = tempdir.path().join("source");
+        let destination = alternate.path().join("destination");
+        fs_err::write(&source, "contents")?;
+
+        let error = with_retry_sync(&source, &destination, "renaming", || {
+            fs_err::rename(&source, &destination)
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::CrossesDevices);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_symlink_removes_directory_link_without_removing_target() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let target = tempdir.path().join("target");
+        fs_err::create_dir(&target)?;
+        fs_err::write(target.join("file"), "content")?;
+        let link = tempdir.path().join("link");
+
+        create_symlink(&target, &link)?;
+        remove_symlink(&link)?;
+
+        assert_matches!(
+            fs_err::symlink_metadata(&link),
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+        );
+        assert_eq!(fs_err::read_to_string(target.join("file"))?, "content");
+        Ok(())
+    }
+
+    #[test]
+    fn remove_virtualenv_removes_directory_link_without_removing_target() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let target = tempdir.path().join("target");
+        fs_err::create_dir(&target)?;
+        let marker = target.join("marker");
+        fs_err::write(&marker, "")?;
+        let environment = tempdir.path().join("environment");
+        create_symlink(&target, &environment)?;
+
+        remove_virtualenv(&environment)?;
+
+        assert_matches!(
+            fs_err::symlink_metadata(environment),
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+        );
+        assert!(marker.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn clear_virtualenv_recreates_missing_directory() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let environment = tempdir.path().join("environment");
+
+        assert!(!clear_virtualenv(&environment)?);
+        assert!(environment.is_dir());
+        Ok(())
+    }
 }

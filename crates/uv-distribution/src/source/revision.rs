@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uv_distribution_types::Hashed;
+use uv_fastid::Id;
 
 use uv_pypi_types::{HashDigest, HashDigests};
 
@@ -14,6 +15,7 @@ use uv_pypi_types::{HashDigest, HashDigests};
 pub(crate) struct Revision {
     id: RevisionId,
     hashes: HashDigests,
+    size: Option<u64>,
 }
 
 impl Revision {
@@ -22,6 +24,7 @@ impl Revision {
         Self {
             id: RevisionId::new(),
             hashes: HashDigests::empty(),
+            size: None,
         }
     }
 
@@ -40,10 +43,22 @@ impl Revision {
         self.hashes
     }
 
+    /// Return the size of the downloaded archive.
+    pub(crate) fn size(&self) -> Option<u64> {
+        self.size
+    }
+
     /// Set the computed hashes of the archive.
     #[must_use]
     pub(crate) fn with_hashes(mut self, hashes: HashDigests) -> Self {
         self.hashes = hashes;
+        self
+    }
+
+    /// Set the size of the downloaded archive.
+    #[must_use]
+    pub(crate) fn with_size(mut self, size: u64) -> Self {
+        self.size = Some(size);
         self
     }
 }
@@ -55,17 +70,19 @@ impl Hashed for Revision {
 }
 
 /// A unique identifier for a revision of a source distribution.
+///
+/// The identifier is serialized as a string in the source-distribution cache.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct RevisionId(String);
+pub(crate) struct RevisionId(Id);
 
 impl RevisionId {
-    /// Generate a new unique identifier for an archive.
+    /// Generate a new unique identifier for a source distribution revision.
     fn new() -> Self {
-        Self(nanoid::nanoid!())
+        Self(Id::secure())
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        self.0.as_str()
+        &self.0
     }
 }
 
@@ -78,5 +95,48 @@ impl AsRef<str> for RevisionId {
 impl AsRef<Path> for RevisionId {
     fn as_ref(&self) -> &Path {
         self.0.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_current_revision() {
+        for size in [None, Some(42)] {
+            let mut original = Revision::new().with_hashes(HashDigests::from(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .parse::<HashDigest>()
+                    .expect("valid SHA-256 digest"),
+            ));
+            if let Some(size) = size {
+                original = original.with_size(size);
+            }
+            let bytes = rmp_serde::to_vec(&original).expect("serialize revision");
+            let parsed: Revision = rmp_serde::from_slice(&bytes).expect("deserialize revision");
+            assert_eq!(parsed.id().as_str(), original.id().as_str());
+            assert_eq!(parsed.hashes(), original.hashes());
+            assert_eq!(parsed.size(), original.size());
+        }
+    }
+
+    #[test]
+    fn serialize_revision_id_as_string() {
+        #[derive(Deserialize)]
+        struct SerializedRevision {
+            id: String,
+            hashes: HashDigests,
+            size: Option<u64>,
+        }
+
+        let revision = Revision::new().with_size(42);
+        let bytes = rmp_serde::to_vec(&revision).expect("serialize revision");
+        let serialized: SerializedRevision =
+            rmp_serde::from_slice(&bytes).expect("deserialize revision with string ID");
+
+        assert_eq!(serialized.id.as_str(), revision.id().as_str());
+        assert_eq!(serialized.hashes, HashDigests::empty());
+        assert_eq!(serialized.size, Some(42));
     }
 }

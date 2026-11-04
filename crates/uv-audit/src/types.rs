@@ -3,7 +3,7 @@
 use jiff::Timestamp;
 use uv_normalize::PackageName;
 use uv_pep440::Version;
-use uv_redacted::DisplaySafeUrl;
+use uv_redacted::SafeUrl;
 use uv_small_str::SmallString;
 
 /// Represents a resolved dependency, with a normalized name and PEP 440 version.
@@ -36,7 +36,7 @@ impl Dependency {
 /// within that bucket. For example, `CVE-2026-12345` or `PYSEC-2023-0001`.
 ///
 /// No assumptions should be made about the format of these identifiers.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VulnerabilityID(SmallString);
 
 impl VulnerabilityID {
@@ -68,6 +68,16 @@ pub enum AdverseStatus {
     Deprecated,
 }
 
+impl std::fmt::Display for AdverseStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Archived => "archived",
+            Self::Quarantined => "quarantined",
+            Self::Deprecated => "deprecated",
+        })
+    }
+}
+
 /// A vulnerability within a dependency.
 #[derive(Debug)]
 pub struct Vulnerability {
@@ -80,7 +90,7 @@ pub struct Vulnerability {
     /// A full-length description of the vulnerability, if available.
     pub description: Option<String>,
     /// A link to more information about the vulnerability, if available.
-    pub link: Option<DisplaySafeUrl>,
+    pub link: Option<SafeUrl>,
     /// Zero or more versions that fix the vulnerability.
     pub fix_versions: Vec<Version>,
     /// Zero or more aliases for this vulnerability in other databases.
@@ -92,12 +102,12 @@ pub struct Vulnerability {
 }
 
 impl Vulnerability {
-    pub fn new(
+    pub(crate) fn new(
         dependency: Dependency,
         id: VulnerabilityID,
         summary: Option<String>,
         description: Option<String>,
-        link: Option<DisplaySafeUrl>,
+        link: Option<SafeUrl>,
         fix_versions: Vec<Version>,
         aliases: Vec<VulnerabilityID>,
         published: Option<Timestamp>,
@@ -134,21 +144,21 @@ impl Vulnerability {
     /// For our purposes we prefer PYSEC IDs, then GHSA, then CVE, then whatever
     /// primary ID the vulnerability came with.
     pub fn best_id(&self) -> &VulnerabilityID {
-        self.ids()
-            .find(|id| {
-                id.as_str().starts_with("PYSEC-")
-                    || id.as_str().starts_with("GHSA-")
-                    || id.as_str().starts_with("CVE-")
-            })
+        ["PYSEC-", "GHSA-", "CVE-"]
+            .into_iter()
+            .find_map(|prefix| self.ids().find(|id| id.as_str().starts_with(prefix)))
             .unwrap_or(&self.id)
     }
 }
 
 /// An adverse project status, such as an archived or deprecated project.
+///
+/// PEP 792 status markers are project-level, so this finding carries only the
+/// project name — not a specific version.
 #[derive(Debug)]
 pub struct ProjectStatus {
-    /// The dependency with the adverse status.
-    pub dependency: Dependency,
+    /// The name of the project with the adverse status.
+    pub name: PackageName,
     /// The adverse status of the project.
     pub status: AdverseStatus,
     /// An optional (index-supplied) reason for the adverse status.

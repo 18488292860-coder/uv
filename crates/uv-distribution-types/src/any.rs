@@ -5,6 +5,7 @@ use uv_normalize::PackageName;
 use uv_pep440::Version;
 
 use crate::cached::CachedDist;
+use crate::id::canonical_source_url;
 use crate::installed::InstalledDist;
 use crate::{InstalledMetadata, InstalledVersion, Name};
 
@@ -14,8 +15,8 @@ use crate::{InstalledMetadata, InstalledVersion, Name};
 /// kind.
 #[derive(Debug, Clone, Eq)]
 pub enum LocalDist {
-    Cached(CachedDist, CanonicalVersion),
-    Installed(InstalledDist, CanonicalVersion),
+    Cached(Box<CachedDist>, CanonicalVersion),
+    Installed(Box<InstalledDist>, CanonicalVersion),
 }
 
 impl LocalDist {
@@ -48,14 +49,14 @@ impl InstalledMetadata for LocalDist {
 impl From<CachedDist> for LocalDist {
     fn from(dist: CachedDist) -> Self {
         let version = CanonicalVersion::from(dist.installed_version());
-        Self::Cached(dist, version)
+        Self::Cached(Box::new(dist), version)
     }
 }
 
 impl From<InstalledDist> for LocalDist {
     fn from(dist: InstalledDist) -> Self {
         let version = CanonicalVersion::from(dist.installed_version());
-        Self::Installed(dist, version)
+        Self::Installed(Box::new(dist), version)
     }
 }
 
@@ -84,7 +85,7 @@ impl From<InstalledVersion<'_>> for CanonicalVersion {
         match installed_version {
             InstalledVersion::Version(version) => Self::Version(version.clone()),
             InstalledVersion::Url(url, version) => {
-                Self::Url(CanonicalUrl::new(url), version.clone())
+                Self::Url(canonical_source_url(url.clone()), version.clone())
             }
         }
     }

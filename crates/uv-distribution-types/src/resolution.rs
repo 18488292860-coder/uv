@@ -1,6 +1,7 @@
 use uv_distribution_filename::DistExtension;
 use uv_normalize::{ExtraName, GroupName, PackageName};
 use uv_pypi_types::{HashDigest, HashDigests};
+use uv_redacted::policy::Raw;
 
 use crate::{
     BuiltDist, Diagnostic, Dist, IndexMetadata, Name, RequirementSource, ResolvedDist, SourceDist,
@@ -8,9 +9,8 @@ use crate::{
 
 /// A set of packages pinned at specific versions.
 ///
-/// This is similar to [`ResolverOutput`], but represents a resolution for a subset of all
-/// marker environments. For example, the resolution is guaranteed to contain at most one version
-/// for a given package.
+/// This represents a resolution for a subset of marker environments and contains at most one
+/// version of each package.
 #[derive(Debug, Default, Clone)]
 pub struct Resolution {
     graph: petgraph::graph::DiGraph<Node, Edge>,
@@ -31,7 +31,7 @@ impl Resolution {
         &self.graph
     }
 
-    /// Add [`Diagnostics`] to the resolution.
+    /// Add [`ResolutionDiagnostic`]s to the resolution.
     #[must_use]
     pub fn with_diagnostics(mut self, diagnostics: Vec<ResolutionDiagnostic>) -> Self {
         self.diagnostics.extend(diagnostics);
@@ -191,16 +191,6 @@ pub enum Node {
     },
 }
 
-impl Node {
-    /// Returns `true` if the node should be installed.
-    pub fn install(&self) -> bool {
-        match self {
-            Self::Root => false,
-            Self::Dist { install, .. } => *install,
-        }
-    }
-}
-
 /// An edge in the resolution graph.
 #[derive(Debug, Clone)]
 pub enum Edge {
@@ -230,7 +220,7 @@ impl From<&ResolvedDist> for RequirementSource {
                     location.set_fragment(None);
                     Self::Url {
                         url: wheel.url.clone(),
-                        location,
+                        location: location.with_policy(Raw),
                         subdirectory: None,
                         ext: DistExtension::Wheel,
                     }
@@ -238,6 +228,12 @@ impl From<&ResolvedDist> for RequirementSource {
                 Dist::Built(BuiltDist::Path(wheel)) => Self::Path {
                     install_path: wheel.install_path.clone(),
                     url: wheel.url.clone(),
+                    ext: DistExtension::Wheel,
+                },
+                Dist::Built(BuiltDist::GitPath(wheel)) => Self::GitPath {
+                    url: wheel.url.clone(),
+                    git: (*wheel.git).clone(),
+                    install_path: wheel.install_path.clone(),
                     ext: DistExtension::Wheel,
                 },
                 Dist::Source(SourceDist::Registry(sdist)) => Self::Registry {
@@ -252,12 +248,18 @@ impl From<&ResolvedDist> for RequirementSource {
                     location.set_fragment(None);
                     Self::Url {
                         url: sdist.url.clone(),
-                        location,
+                        location: location.with_policy(Raw),
                         subdirectory: sdist.subdirectory.clone(),
                         ext: DistExtension::Source(sdist.ext),
                     }
                 }
-                Dist::Source(SourceDist::Git(sdist)) => Self::Git {
+                Dist::Source(SourceDist::GitPath(sdist)) => Self::GitPath {
+                    url: sdist.url.clone(),
+                    git: (*sdist.git).clone(),
+                    install_path: sdist.install_path.clone(),
+                    ext: DistExtension::Source(sdist.ext),
+                },
+                Dist::Source(SourceDist::GitDirectory(sdist)) => Self::GitDirectory {
                     git: (*sdist.git).clone(),
                     url: sdist.url.clone(),
                     subdirectory: sdist.subdirectory.clone(),

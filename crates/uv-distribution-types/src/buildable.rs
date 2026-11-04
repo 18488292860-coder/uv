@@ -1,5 +1,8 @@
 use std::borrow::Cow;
+use std::fmt;
 use std::path::Path;
+
+use owo_colors::OwoColorize;
 
 use uv_distribution_filename::SourceDistExtension;
 use uv_git_types::GitUrl;
@@ -7,9 +10,12 @@ use uv_pep440::{Version, VersionSpecifiers};
 use uv_pep508::VerbatimUrl;
 
 use uv_normalize::PackageName;
-use uv_redacted::DisplaySafeUrl;
+use uv_redacted::SafeUrl;
 
-use crate::{DirectorySourceDist, GitSourceDist, Name, PathSourceDist, SourceDist};
+use crate::{
+    DirectorySourceDist, DistributionMetadata, GitDirectorySourceDist, GitPathSourceDist, Name,
+    PathSourceDist, SourceDist,
+};
 
 /// A reference to a source that can be built into a built distribution.
 ///
@@ -24,6 +30,19 @@ pub enum BuildableSource<'a> {
 }
 
 impl BuildableSource<'_> {
+    /// Display the source with its distribution's version or URL dimmed.
+    pub fn color_display(&self) -> impl fmt::Display + '_ {
+        fmt::from_fn(move |formatter| match self {
+            Self::Dist(dist) => write!(
+                formatter,
+                "{}{}",
+                dist.name(),
+                dist.version_or_url().dimmed()
+            ),
+            Self::Url(url) => fmt::Display::fmt(url, formatter),
+        })
+    }
+
     /// Return the [`PackageName`] of the source, if available.
     pub fn name(&self) -> Option<&PackageName> {
         match self {
@@ -66,6 +85,14 @@ impl BuildableSource<'_> {
         }
     }
 
+    /// Returns `true` if the source is a first-party workspace member.
+    pub fn is_first_party(&self) -> bool {
+        match self {
+            Self::Dist(dist) => dist.is_first_party(),
+            Self::Url(_) => false,
+        }
+    }
+
     /// Return true if the source refers to a local source tree (i.e., a directory).
     pub fn is_source_tree(&self) -> bool {
         match self {
@@ -79,7 +106,7 @@ impl BuildableSource<'_> {
         let Self::Dist(SourceDist::Registry(dist)) = self else {
             return None;
         };
-        dist.file.requires_python.as_ref()
+        dist.file.requires_python.as_deref()
     }
 }
 
@@ -96,24 +123,26 @@ impl std::fmt::Display for BuildableSource<'_> {
 #[derive(Debug, Clone)]
 pub enum SourceUrl<'a> {
     Direct(DirectSourceUrl<'a>),
-    Git(GitSourceUrl<'a>),
+    GitDirectory(GitDirectorySourceUrl<'a>),
+    GitPath(GitPathSourceUrl<'a>),
     Path(PathSourceUrl<'a>),
     Directory(DirectorySourceUrl<'a>),
 }
 
 impl SourceUrl<'_> {
-    /// Return the [`DisplaySafeUrl`] of the source.
-    pub fn url(&self) -> &DisplaySafeUrl {
+    /// Return the [`SafeUrl`] of the source.
+    pub fn url(&self) -> &SafeUrl {
         match self {
             Self::Direct(dist) => dist.url,
-            Self::Git(dist) => dist.url,
+            Self::GitDirectory(dist) => dist.url,
+            Self::GitPath(dist) => dist.url,
             Self::Path(dist) => dist.url,
             Self::Directory(dist) => dist.url,
         }
     }
 
     /// Return the source tree of the source, if available.
-    pub fn source_tree(&self) -> Option<&Path> {
+    fn source_tree(&self) -> Option<&Path> {
         match self {
             Self::Directory(dist) => Some(dist.install_path),
             _ => None,
@@ -121,7 +150,7 @@ impl SourceUrl<'_> {
     }
 
     /// Returns `true` if the source is editable.
-    pub fn is_editable(&self) -> bool {
+    fn is_editable(&self) -> bool {
         matches!(
             self,
             Self::Directory(DirectorySourceUrl {
@@ -130,18 +159,14 @@ impl SourceUrl<'_> {
             })
         )
     }
-
-    /// Return true if the source refers to a local file or directory.
-    pub fn is_local(&self) -> bool {
-        matches!(self, Self::Path(_) | Self::Directory(_))
-    }
 }
 
 impl std::fmt::Display for SourceUrl<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Direct(url) => write!(f, "{url}"),
-            Self::Git(url) => write!(f, "{url}"),
+            Self::GitDirectory(url) => write!(f, "{url}"),
+            Self::GitPath(url) => write!(f, "{url}"),
             Self::Path(url) => write!(f, "{url}"),
             Self::Directory(url) => write!(f, "{url}"),
         }
@@ -150,7 +175,7 @@ impl std::fmt::Display for SourceUrl<'_> {
 
 #[derive(Debug, Clone)]
 pub struct DirectSourceUrl<'a> {
-    pub url: &'a DisplaySafeUrl,
+    pub url: &'a SafeUrl,
     pub subdirectory: Option<&'a Path>,
     pub ext: SourceDistExtension,
 }
@@ -162,7 +187,33 @@ impl std::fmt::Display for DirectSourceUrl<'_> {
 }
 
 #[derive(Debug, Clone)]
-pub struct GitSourceUrl<'a> {
+pub struct GitPathSourceUrl<'a> {
+    /// The URL with the revision and path fragment.
+    pub url: &'a VerbatimUrl,
+    pub git: &'a GitUrl,
+    pub path: Cow<'a, Path>,
+    pub ext: SourceDistExtension,
+}
+
+impl std::fmt::Display for GitPathSourceUrl<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{url}", url = self.url)
+    }
+}
+
+impl<'a> From<&'a GitPathSourceDist> for GitPathSourceUrl<'a> {
+    fn from(dist: &'a GitPathSourceDist) -> Self {
+        Self {
+            url: &dist.url,
+            git: &dist.git,
+            path: Cow::Borrowed(&dist.install_path),
+            ext: dist.ext,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GitDirectorySourceUrl<'a> {
     /// The URL with the revision and subdirectory fragment.
     pub url: &'a VerbatimUrl,
     pub git: &'a GitUrl,
@@ -170,14 +221,14 @@ pub struct GitSourceUrl<'a> {
     pub subdirectory: Option<&'a Path>,
 }
 
-impl std::fmt::Display for GitSourceUrl<'_> {
+impl std::fmt::Display for GitDirectorySourceUrl<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{url}", url = self.url)
     }
 }
 
-impl<'a> From<&'a GitSourceDist> for GitSourceUrl<'a> {
-    fn from(dist: &'a GitSourceDist) -> Self {
+impl<'a> From<&'a GitDirectorySourceDist> for GitDirectorySourceUrl<'a> {
+    fn from(dist: &'a GitDirectorySourceDist) -> Self {
         Self {
             url: &dist.url,
             git: &dist.git,
@@ -188,7 +239,7 @@ impl<'a> From<&'a GitSourceDist> for GitSourceUrl<'a> {
 
 #[derive(Debug, Clone)]
 pub struct PathSourceUrl<'a> {
-    pub url: &'a DisplaySafeUrl,
+    pub url: &'a SafeUrl,
     pub path: Cow<'a, Path>,
     pub ext: SourceDistExtension,
 }
@@ -211,7 +262,7 @@ impl<'a> From<&'a PathSourceDist> for PathSourceUrl<'a> {
 
 #[derive(Debug, Clone)]
 pub struct DirectorySourceUrl<'a> {
-    pub url: &'a DisplaySafeUrl,
+    pub url: &'a SafeUrl,
     pub install_path: &'a Path,
     pub editable: Option<bool>,
 }

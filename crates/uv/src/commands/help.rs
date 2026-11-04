@@ -10,9 +10,8 @@ use itertools::Itertools;
 use owo_colors::OwoColorize;
 use which::which;
 
-use super::ExitStatus;
-use crate::printer::Printer;
 use uv_cli::Cli;
+use uv_command_support::{ExitStatus, Printer};
 use uv_static::EnvVars;
 
 // hidden subcommands to show in the help command
@@ -81,6 +80,10 @@ pub(crate) fn help(query: &[String], printer: Printer, no_pager: bool) -> Result
     } else {
         reformat_env_annotations(&help.ansi().to_string())
     };
+
+    // Trim trailing whitespace from each line (https://github.com/clap-rs/clap/issues/5074).
+    let help_plain = help_plain.lines().map(str::trim_end).join("\n");
+    let help_ansi = help_ansi.lines().map(str::trim_end).join("\n");
 
     let want_color = match anstream::Stdout::choice(&std::io::stdout()) {
         ColorChoice::Always | ColorChoice::AlwaysAnsi => true,

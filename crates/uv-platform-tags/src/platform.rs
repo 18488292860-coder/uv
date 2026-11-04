@@ -1,9 +1,12 @@
 //! Abstractions for understanding the current platform (operating system and architecture).
 
 use std::str::FromStr;
+use std::sync::Arc;
 use std::{fmt, io};
 
 use thiserror::Error;
+
+use crate::ParseReleaseArchError;
 
 #[derive(Error, Debug)]
 pub enum PlatformError {
@@ -11,6 +14,12 @@ pub enum PlatformError {
     IOError(#[from] io::Error),
     #[error("Failed to detect the operating system version: {0}")]
     OsVersionDetectionError(String),
+    #[error("Invalid platform release and architecture `{release_arch}`: {error}")]
+    InvalidReleaseArch {
+        release_arch: String,
+        #[source]
+        error: ParseReleaseArchError,
+    },
     #[error("Invalid Android architecture: {0}")]
     InvalidAndroidArch(Arch),
     #[error("Invalid iOS simulator architecture: {0}")]
@@ -19,16 +28,64 @@ pub enum PlatformError {
     InvalidIosDeviceArch(Arch),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+/// Raw CPU data reported by the interpreter and retained in its cache so providers can
+/// interpret additional features without querying it again.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CpuInfo {
+    /// Feature names exposed by Linux through `/proc/cpuinfo` or macOS through `sysctl`.
+    Flags { flags: Box<str> },
+    /// Raw CPUID registers and OS-enabled register state (XCR0), queried directly on Windows.
+    Cpuid { leaves: Vec<CpuidLeaf>, xstate: u64 },
+    /// Apple Silicon model reported by `machdep.cpu.brand_string`.
+    AppleSilicon { brand: Box<str> },
+    /// Linux core IDs from `/proc/cpuinfo` and process-wide capabilities from the auxiliary vector.
+    LinuxAarch64 {
+        cores: Vec<(Box<str>, Box<str>)>,
+        /// `AT_HWCAP` through `AT_HWCAP4`, in order.
+        hwcaps: [u64; 4],
+    },
+}
+
+/// Raw CPUID output for an input leaf and subleaf.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct CpuidLeaf {
+    pub leaf: u32,
+    pub subleaf: u32,
+    /// EAX, EBX, ECX, and EDX, in that order.
+    pub registers: [u32; 4],
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Platform {
     os: Os,
     arch: Arch,
+    /// CPU capabilities reported by the interpreter, if this platform came from a probe.
+    cpu_info: Option<Arc<CpuInfo>>,
 }
 
 impl Platform {
     /// Create a new platform from the given operating system and architecture.
     pub const fn new(os: Os, arch: Arch) -> Self {
-        Self { os, arch }
+        Self {
+            os,
+            arch,
+            cpu_info: None,
+        }
+    }
+
+    /// Create a platform from the operating system, architecture, and CPU data of an interpreter.
+    pub fn from_interpreter(os: Os, arch: Arch, cpu_info: Option<CpuInfo>) -> Self {
+        Self {
+            os,
+            arch,
+            cpu_info: cpu_info.map(Arc::new),
+        }
+    }
+
+    /// The CPU capabilities reported by the interpreter, if available.
+    pub fn cpu_info(&self) -> Option<&CpuInfo> {
+        self.cpu_info.as_deref()
     }
 
     /// Return the platform's operating system.
@@ -47,6 +104,7 @@ impl Platform {
             Os::Manylinux { .. } | Os::Musllinux { .. } => "Linux",
             Os::Windows => "Windows",
             Os::Pyodide { .. } => "Pyodide",
+            Os::PyEmscripten { .. } => "Emscripten",
             Os::Macos { .. } => "macOS",
             Os::FreeBsd { .. } => "FreeBSD",
             Os::NetBsd { .. } => "NetBSD",
@@ -75,6 +133,10 @@ pub enum Os {
     },
     Windows,
     Pyodide {
+        major: u16,
+        minor: u16,
+    },
+    PyEmscripten {
         major: u16,
         minor: u16,
     },
@@ -126,6 +188,7 @@ impl fmt::Display for Os {
             Self::Haiku { .. } => write!(f, "haiku"),
             Self::Android { .. } => write!(f, "android"),
             Self::Pyodide { .. } => write!(f, "pyodide"),
+            Self::PyEmscripten { .. } => write!(f, "pyemscripten"),
             Self::Ios { .. } => write!(f, "ios"),
         }
     }
@@ -204,7 +267,7 @@ impl FromStr for Arch {
 impl Arch {
     /// Returns the oldest possible `manylinux` tag for this architecture, if it supports
     /// `manylinux`.
-    pub fn get_minimum_manylinux_minor(&self) -> Option<u16> {
+    pub(crate) fn get_minimum_manylinux_minor(self) -> Option<u16> {
         match self {
             // manylinux 2014
             Self::Aarch64 | Self::Armv7L | Self::Powerpc64 | Self::Powerpc64Le | Self::S390X => {
@@ -245,7 +308,7 @@ impl Arch {
     /// This is the same as the native platform's `uname -m` output.
     ///
     /// Based on: <https://github.com/PyO3/maturin/blob/8ab42219247277fee513eac753a3e90e76cd46b9/src/target/mod.rs#L131>
-    pub fn machine(&self) -> &'static str {
+    pub(crate) fn machine(self) -> &'static str {
         match self {
             Self::Aarch64 => "arm64",
             Self::Armv5TEL | Self::Armv6L | Self::Armv7L => "arm",
@@ -288,5 +351,18 @@ mod tests {
         );
 
         assert_eq!(platform.pretty(), "Linux x86_64");
+    }
+
+    #[test]
+    fn platform_pretty_pyemscripten() {
+        let platform = Platform::new(
+            Os::PyEmscripten {
+                major: 2026,
+                minor: 0,
+            },
+            Arch::Wasm32,
+        );
+
+        assert_eq!(platform.pretty(), "Emscripten wasm32");
     }
 }

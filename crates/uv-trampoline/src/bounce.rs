@@ -25,8 +25,6 @@ use windows::core::{PSTR, s};
 
 use uv_windows::{Job, install_ctrl_handler};
 
-use uv_static::EnvVars;
-
 use crate::{error, format, warn};
 
 // https://learn.microsoft.com/en-us/windows/win32/menurc/resource-types
@@ -142,42 +140,14 @@ fn make_child_cmdline() -> CString {
             // SAFETY: `std::env::set_var` is safe to call on Windows, and
             // this code only ever runs on Windows.
             unsafe {
-                // Setting this env var will cause `getpath.py` to set
-                // `executable` to the path to this trampoline. This is
-                // the approach taken by CPython for Python Launchers
-                // (in `launcher.c`). This allows virtual environments to
-                // be correctly detected when using trampolines.
-                std::env::set_var(EnvVars::PYVENV_LAUNCHER, &executable_name);
-
-                // If this is not a virtual environment, set `PYTHONHOME` to
-                // the parent directory of the executable. This ensures that
-                // the correct installation directories are added to `sys.path`
-                // when running with a junction trampoline.
-                //
-                // We use a marker variable (`UV_INTERNAL__PYTHONHOME`) to track
-                // whether `PYTHONHOME` was set by uv. This allows us to:
-                // - Override inherited `PYTHONHOME` from parent Python processes
-                // - Preserve user-defined `PYTHONHOME` values
-                if !is_virtualenv(python_exe.as_path()) {
-                    let python_home = std::env::var(EnvVars::PYTHONHOME).ok();
-                    let marker = std::env::var(EnvVars::UV_INTERNAL__PYTHONHOME).ok();
-
-                    // Only set `PYTHONHOME` if:
-                    // - It's not set, OR
-                    // - It was set by uv (marker matches current `PYTHONHOME`)
-                    let should_override = match (&python_home, &marker) {
-                        (None, _) => true,
-                        (Some(home), Some(m)) if home == m => true,
-                        _ => false,
-                    };
-
-                    if should_override {
-                        let home = python_exe
-                            .parent()
-                            .expect("Python executable should have a parent directory");
-                        std::env::set_var(EnvVars::PYTHONHOME, home);
-                        std::env::set_var(EnvVars::UV_INTERNAL__PYTHONHOME, home);
-                    }
+                if is_virtualenv(&executable_name) {
+                    // Setting this env var will cause `getpath.py` to set
+                    // `executable` to the path to this trampoline. This is
+                    // the approach taken by CPython for Python Launchers
+                    // (in `launcher.c`). This allows virtual environments to
+                    // be correctly detected when using trampolines. This
+                    // environment variable is cleared by getpath.
+                    std::env::set_var("__PYVENV_LAUNCHER__", &executable_name);
                 }
             }
         }
@@ -336,11 +306,7 @@ fn spawn_child(si: &STARTUPINFOA, child_cmdline: CString) -> HANDLE {
     child_process_info.hProcess
 }
 
-// Apparently, the Windows C runtime has a secret way to pass file descriptors into child
-// processes, by using the .lpReserved2 field. We want to close those file descriptors too.
-// The UCRT source code has details on the memory layout (see also initialize_inherited_file_handles_nolock):
-// https://github.com/huangqinjin/ucrt/blob/10.0.19041.0/lowio/ioinit.cpp#L190-L223
-fn close_handles(si: &STARTUPINFOA) {
+fn close_standard_pipes() {
     // See distlib/PC/launcher.c::cleanup_standard_io()
     // Unlike cleanup_standard_io(), we don't close STD_ERROR_HANDLE to retain warn!
     for std_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE] {
@@ -355,29 +321,6 @@ fn close_handles(si: &STARTUPINFOA) {
                 warn!("Failed to modify standard device handle {}", std_handle.0);
             });
         }
-    }
-
-    // See distlib/PC/launcher.c::cleanup_fds()
-    if si.cbReserved2 == 0 || si.lpReserved2.is_null() {
-        return;
-    }
-
-    let crt_magic = si.lpReserved2 as *const u32;
-    let handle_count = unsafe { crt_magic.read_unaligned() } as isize;
-    let handle_start =
-        unsafe { (crt_magic.offset(1) as *const u8).offset(handle_count) as *const HANDLE };
-
-    // Close all fds inherited from the parent, except for the standard I/O fds (skip first 3).
-    for i in 3..handle_count {
-        let handle = unsafe { handle_start.offset(i).read_unaligned() };
-        // Ignore invalid handles, as that means this fd was not inherited.
-        // -2 is a special value (https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/get-osfhandle)
-        if handle.is_invalid() || handle.0 == -2 as _ {
-            continue;
-        }
-        unsafe { CloseHandle(handle) }.unwrap_or_else(|_| {
-            warn!("Failed to close child file descriptors at {}", i);
-        });
     }
 }
 
@@ -446,6 +389,8 @@ pub fn bounce(is_gui: bool) -> ! {
     let mut si = STARTUPINFOA::default();
     unsafe { GetStartupInfoA(&mut si) }
 
+    // Forward lpReserved2 verbatim for Python's runtime. Even a CRT descriptor table can
+    // list handles the trampoline never inherited.
     let child_handle = spawn_child(&si, child_cmdline);
     let job = Job::new().unwrap_or_else(|e| {
         print_job_error_and_exit("uv trampoline failed to create job object", e);
@@ -473,8 +418,7 @@ pub fn bounce(is_gui: bool) -> ! {
         );
     }
 
-    // (best effort) Close all the handles that we can
-    close_handles(&si);
+    close_standard_pipes();
 
     // (best effort) Switch to some innocuous directory, so we don't hold the original cwd open.
     // See distlib/PC/launcher.c::switch_working_directory
