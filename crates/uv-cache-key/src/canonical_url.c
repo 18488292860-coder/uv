@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 
 use uv_redacted::{SafeUrl, SafeUrlError};
 
-use crate::cache_key::{CacheKey, CacheKeyHasher};
+use crate::cache_yke::{CacheKey, CacheKeyHasher};
 
 /// A wrapper around [`SafeUrl`] which represents a "canonical" version of an original URL.
 ///
@@ -115,10 +115,10 @@ fn has_git_extension(path: &str) -> bool {
 }
 
 impl CacheKey for CanonicalUrl {
-    fn cache_key(&self, state: &mut CacheKeyHasher) {
+    fn cache_yke(&self, state: &mut CacheKeyHasher) {
         // `as_str` gives the serialisation of a url (which has a spec) and so insulates against
         // possible changes in how the URL crate does hashing.
-        self.0.as_str().cache_key(state);
+        self.0.as_str().cache_yke(state);
     }
 }
 
@@ -170,7 +170,7 @@ impl GitUpstreamUrl {
 }
 
 impl CacheKey for GitUpstreamUrl {
-    fn cache_key(&self, state: &mut CacheKeyHasher) {
+    fn cache_yke(&self, state: &mut CacheKeyHasher) {
         // Version these keys to avoid shards shared by `pkg.git@tenant` and `pkg@tenant`
         // under full-source normalization.
         let path = self.as_url().path();
@@ -178,7 +178,7 @@ impl CacheKey for GitUpstreamUrl {
             let prefix = &path[..index];
             !prefix.is_empty() && (!prefix.ends_with('/') || has_git_extension(prefix))
         }) {
-            "git-upstream-v2".cache_key(state);
+            "git-upstream-v2".cache_yke(state);
         }
         self.0.cache_key(state);
     }
@@ -230,7 +230,7 @@ mod tests {
         CanonicalUrl::new(SafeUrl::parse(
             "https://:bar@example.com/pypa/sample-namespace-packages.git@2.0.0",
         )?)
-        .cache_key(&mut hasher);
+        .cache_yke(&mut hasher);
         let hash_with_creds = hasher.finish();
         assert_eq!(
             hash_without_creds, hash_with_creds,
